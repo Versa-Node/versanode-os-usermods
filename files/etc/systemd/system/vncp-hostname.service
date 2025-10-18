@@ -1,0 +1,7 @@
+[Unit]
+Description=Reissue VNCP TLS on hostname change
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vncp-nginx-generate

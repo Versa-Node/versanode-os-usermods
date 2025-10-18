@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+OUT_HTTP="/etc/nginx/conf.d/vncp-proxies-80.conf"
+OUT_HTTPS="/etc/nginx/conf.d/vncp-proxies-443.conf"
+LABEL_KEY="io.versanode.vncp.proxies"
+LISTEN_ADDR_HTTP="${LISTEN_ADDR_HTTP:-80}"
+LISTEN_ADDR_HTTPS="${LISTEN_ADDR_HTTPS:-443}"
+COCKPIT_PORT="${COCKPIT_PORT:-9090}"
+NETWORK="${NETWORK:-<any>}"
+RELOAD_CMD="${RELOAD_CMD:-systemctl reload nginx}"
+
+# TLS knobs
+TLS_ENABLE="${TLS_ENABLE:-1}"
+TLS_DIR="${TLS_DIR:-/etc/nginx/tls}"
+CA_DIR="${CA_DIR:-$TLS_DIR/ca}"
+CA_KEY="$CA_DIR/ca.key"
+CA_CRT="$CA_DIR/ca.crt"
+SRV_DIR="${SRV_DIR:-$TLS_DIR/server}"
+SRV_KEY="$SRV_DIR/server.key"
+SRV_CRT="$SRV_DIR/server.crt"
+SRV_CSR="$SRV_DIR/server.csr"
+SRV_SANS="${SRV_SANS:-}"
+TLS_CIPHERS="${TLS_CIPHERS:-HIGH:!aNULL:!MD5}"
+TLS_PROTOCOLS="${TLS_PROTOCOLS:-TLSv1.2 TLSv1.3}"
+SRV_DAYS="${SRV_DAYS:-825}"
+RENEW_DAYS="${RENEW_DAYS:-10}"
+
+STATE_DIR="${STATE_DIR:-/var/lib/vncp-nginx}"
+LAST_HOST_FILE="$STATE_DIR/last_hostname"
+
+log(){ echo "[vncp-nginx] $*"; }
+dbg(){ [[ "${DEBUG:-0}" -eq 1 ]] && echo "[vncp-nginx][dbg] $*" >&2 || true; }
+die(){ echo "[vncp-nginx][err] $*" >&2; exit 1; }
+
+b64decode(){ printf "%s" "$1" | tr -d '\n' | base64 -d 2>/dev/null || true; }
+get_upstream_host(){
+  local cid="$1" netpref="$2"
+  if [[ "${netpref}" == "<host>" ]]; then echo "127.0.0.1"; return; fi
+  local mode; mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$cid" 2>/dev/null || true)"
+  if [[ "${mode}" == "host" ]]; then echo "127.0.0.1"; return; fi
+  if [[ "${netpref}" != "<any>" && -n "${netpref}" ]]; then
+    docker inspect "$cid" | jq -r --arg n "$netpref" '.[0].NetworkSettings.Networks[$n].IPAddress // empty' | sed -n '1p'
+  else
+    docker inspect "$cid" | jq -r '.[0].NetworkSettings.Networks | to_entries[0].value.IPAddress // empty' | sed -n '1p'
+  fi
+}
+subst_block(){
+  local block="$1" slug="$2" path="$3" host="$4" port="$5"
+  local upstream="http://${host}:${port}"
+  esc(){ printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'; }
+  local e_path e_slug e_host e_port e_upstream
+  e_path="$(esc "$path")"; e_slug="$(esc "$slug")"; e_host="$(esc "$host")"; e_port="$(esc "$port")"; e_upstream="$(esc "$upstream")"
+  block="$(printf "%s" "$block" | sed \
+    -e "s/\${PATH}/${e_path}/g" \
+    -e "s/\${SLUG}/${e_slug}/g" \
+    -e "s/\${UPSTREAM_IP}/${e_host}/g" \
+    -e "s/\${UPSTREAM_PORT}/${e_port}/g" \
+    -e "s|\${UPSTREAM}|${e_upstream}|g")"
+  printf "%s" "$block" | sed -e 's/\$\$/$/g'
+}
+wrap_block_with_marker(){
+  local slug="$1" cid="$2" host="$3" port="$4" body="$5"
+  cat <<EOF
+    # ---- proxy: /${slug}  (cid=${cid} upstream=${host}:${port}) ----
+$(printf "%s\n" "$body")
+EOF
+}
+
+collect_sans(){
+  local host ip sans=()
+  host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)"
+  [[ -n "$host" ]] && sans+=("DNS:${host}")
+  local sh; sh="$(hostname -s 2>/dev/null || true)"; [[ -n "$sh" && "$sh" != "$host" ]] && sans+=("DNS:${sh}")
+  while read -r ip; do
+    [[ -n "$ip" ]] && sans+=("IP:${ip}")
+  done < <(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1)
+  if [[ -n "$SRV_SANS" ]]; then
+    IFS=',' read -ra extra <<<"$SRV_SANS"
+    for e in "${extra[@]}"; do [[ -n "$e" ]] && sans+=("$e"); done
+  fi
+  printf "%s" "$(IFS=, ; echo "${sans[*]}")"
+}
+
+ensure_tls(){
+  [[ "$TLS_ENABLE" -eq 1 ]] || return 0
+  mkdir -p "$CA_DIR" "$SRV_DIR" "$STATE_DIR"
+
+  # Hostname change → force reissue
+  local current_host; current_host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)"
+  local last_host=""
+  [[ -s "$LAST_HOST_FILE" ]] && last_host="$(cat "$LAST_HOST_FILE" 2>/dev/null || true)" || true
+  if [[ "$current_host" != "$last_host" ]]; then
+    echo "$current_host" > "$LAST_HOST_FILE"
+    rm -f "$SRV_KEY" "$SRV_CRT" "$SRV_CSR"
+    log "Hostname changed (${last_host} -> ${current_host}); reissuing server cert."
+  fi
+
+  # Ensure CA (10y)
+  if [[ ! -s "$CA_KEY" || ! -s "$CA_CRT" ]]; then
+    log "Creating local CA (once) in $CA_DIR"
+    openssl genrsa -out "$CA_KEY" 4096 >/dev/null 2>&1
+    openssl req -x509 -new -nodes -key "$CA_KEY" -sha256 -days 3650 \
+      -subj "/CN=VersaNode Local CA" -out "$CA_CRT" >/dev/null 2>&1
+  fi
+
+  # Renew if expiry < RENEW_DAYS
+  if [[ -s "$SRV_CRT" ]]; then
+    enddate="$(openssl x509 -enddate -noout -in "$SRV_CRT" 2>/dev/null | cut -d= -f2 || true)"
+    if [[ -n "$enddate" ]]; then
+      expiry_ts="$(date -d "$enddate" +%s 2>/dev/null || true)"
+      now_ts="$(date +%s)"
+      if [[ -n "$expiry_ts" ]]; then
+        days_left="$(( (expiry_ts - now_ts) / 86400 ))"
+        if (( days_left < RENEW_DAYS )); then
+          log "Server cert expires in ${days_left} days (< ${RENEW_DAYS}); renewing."
+          rm -f "$SRV_KEY" "$SRV_CRT" "$SRV_CSR"
+        fi
+      fi
+    fi
+  fi
+
+  # Issue if needed
+  if [[ ! -s "$SRV_KEY" || ! -s "$SRV_CRT" ]]; then
+    local SANS; SANS="$(collect_sans)"
+    log "Issuing server certificate (SANs: $SANS, days: ${SRV_DAYS})"
+    cat >"$SRV_DIR/openssl.cnf" <<CFG
+[req]
+distinguished_name=req
+req_extensions=req_ext
+prompt=no
+[req_ext]
+subjectAltName=${SANS}
+CFG
+    openssl genrsa -out "$SRV_KEY" 2048 >/dev/null 2>&1
+    openssl req -new -key "$SRV_KEY" -subj "/CN=vncp-local" \
+      -out "$SRV_CSR" -config "$SRV_DIR/openssl.cnf" >/dev/null 2>&1
+    openssl x509 -req -in "$SRV_CSR" -CA "$CA_CRT" -CAkey "$CA_KEY" -CAcreateserial \
+      -out "$SRV_CRT" -days "$SRV_DAYS" -sha256 -extfile "$SRV_DIR/openssl.cnf" -extensions req_ext >/dev/null 2>&1
+    chmod 600 "$SRV_KEY"
+  fi
+}
+
+# Collect label-driven proxies
+entries_json="[]"
+mapfile -t CIDS < <(docker ps -q --filter "label=${LABEL_KEY}") || true
+for cid in "${CIDS[@]:-}"; do
+  raw_label="$(docker inspect -f "{{ index .Config.Labels \"${LABEL_KEY}\" }}" "$cid" 2>/dev/null || true)"
+  [[ -z "${raw_label}" || "${raw_label}" == "<no value>" ]] && continue
+  normalized_array="$(
+    printf '%s' "$raw_label" | jq -c '
+      . as $raw
+      | ((try (fromjson) catch $raw)) as $val
+      | if ($val|type) == "array" then $val
+        elif ($val|type) == "object" then
+          [ $val | to_entries[] | { slug:(.key|tostring), v:.value }
+            | (if (.v|type) == "object" then . + .v
+               elif ((.v|type) == "string" or (.v|type) == "number") then . + { port:(.v|tostring) }
+               else . end)
+            | del(.v) ]
+        else [] end
+      | map({
+          slug:(.slug?|tostring|ascii_downcase),
+          port:(.port?//""|tostring),
+          nginx_block_b64:(.nginx_block_b64?//""|tostring),
+          nginx_block:(.nginx_block?//""|tostring)
+        })
+      | map(select(.slug != "" and .port != ""))'
+  )"
+  with_cid="$(jq --arg cid "$cid" 'map(. + { __cid: $cid })' <<<"$normalized_array")"
+  entries_json="$(jq -s 'add' <(printf '%s' "$entries_json") <(printf '%s' "$with_cid"))"
+done
+count="$(jq 'length' <<<"$entries_json")"
+
+ensure_tls
+
+tmp80="$(mktemp)"; tmp443="$(mktemp)"; trap 'rm -f "$tmp80" "$tmp443"' EXIT
+mkdir -p "$(dirname "$OUT_HTTP")" "$(dirname "$OUT_HTTPS")"
+
+# Port 80: redirect everything to HTTPS
+cat >"$tmp80" <<EOF
+# AUTOGENERATED — DO NOT EDIT.
+server {
+    listen ${LISTEN_ADDR_HTTP} default_server;
+    server_name _;
+    location = /healthz { return 200; }
+    location / { return 308 https://\$host\$request_uri; }
+}
+EOF
+
+# Port 443: TLS vhost + Cockpit + label proxies
+cat >"$tmp443" <<EOF
+# AUTOGENERATED — DO NOT EDIT.
+server {
+    listen ${LISTEN_ADDR_HTTPS} ssl http2 default_server;
+    server_name _;
+    ssl_certificate     ${SRV_CRT};
+    ssl_certificate_key ${SRV_KEY};
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:MozSSL:10m;
+    ssl_session_tickets off;
+    ssl_protocols ${TLS_PROTOCOLS};
+    ssl_ciphers   ${TLS_CIPHERS};
+    ssl_prefer_server_ciphers on;
+
+    location = /healthz { return 200; }
+    location = / { return 308 /cockpit/; }
+    location = /cockpit { return 308 /cockpit/; }
+
+    location ^~ /cockpit/ {
+        proxy_pass http://127.0.0.1:${COCKPIT_PORT}/cockpit/;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_redirect off;
+        gzip off;
+    }
+
+EOF
+
+if [[ "$count" -gt 0 ]]; then
+  for i in $(seq 0 $((count-1))); do
+    item="$(jq -r ".[$i]" <<<"$entries_json")"
+    slug="$(jq -r '.slug' <<<"$item")"
+    port="$(jq -r '.port' <<<"$item")"
+    b64="$(jq -r '.nginx_block_b64 // ""' <<<"$item")"
+    ptxt="$(jq -r '.nginx_block // ""' <<<"$item")"
+    cid="$(jq -r '.__cid' <<<"$item")"
+    host="$(get_upstream_host "$cid" "$NETWORK" || true)"
+    [[ -z "$host" ]] && continue
+
+    block_src=""
+    if [[ -n "$b64" ]]; then block_src="$(b64decode "$b64")"
+    elif [[ -n "$ptxt" ]]; then block_src="$ptxt"
+    else continue; fi
+
+    path="/${slug}"
+    block_final="$(subst_block "$block_src" "$slug" "$path" "$host" "$port")"
+    block_final_indented="$(printf "%s" "$block_final" | sed 's/^/    /')"
+
+    cat >>"$tmp443" <<EOF
+    # ---- proxy: /${slug}  (cid=${cid} upstream=${host}:${port}) ----
+${block_final_indented}
+
+EOF
+  done
+fi
+
+cat >>"$tmp443" <<'EOF'
+    location / { return 404; }
+}
+EOF
+
+write_if_changed(){
+  local src="$1" dst="$2"
+  if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+    return 1
+  else
+    install -m 0644 -T "$src" "$dst"
+    return 0
+  fi
+}
+
+changed=0
+write_if_changed "$tmp80"  "$OUT_HTTP"  && changed=1
+write_if_changed "$tmp443" "$OUT_HTTPS" && changed=1
+
+if [[ "$changed" -eq 1 ]]; then
+  if nginx -t >/dev/null 2>&1; then
+    $RELOAD_CMD || true
+    log "Nginx reloaded (TLS + redirects)."
+  else
+    die "nginx -t failed"
+  fi
+else
+  log "No changes; not reloading nginx."
+fi

@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch /etc/hostname and trigger VNCP TLS reissue
+
+[Path]
+PathChanged=/etc/hostname
+
+[Install]
+WantedBy=multi-user.target

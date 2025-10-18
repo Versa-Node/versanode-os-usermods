@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh VNCP Nginx proxy config every 2 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=2min
+Unit=vncp-nginx-generate.service
+
+[Install]
+WantedBy=timers.target
