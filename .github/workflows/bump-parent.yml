@@ -1,0 +1,56 @@
+name: Bump parent submodule immediately
+on:
+  push:
+    branches: [ main ]   # adjust if needed
+
+concurrency:
+  group: bump-parent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout parent repo (versanode-os)
+        uses: actions/checkout@v4
+        with:
+          repository: Versa-Node/versanode-os
+          token: ${{ secrets.PARENT_PUSH_TOKEN }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Update the right submodule to this repo's latest
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          CHILD_REPO="${{ github.repository }}"   # e.g., Versa-Node/versanode-os-kmods
+          case "$CHILD_REPO" in
+            Versa-Node/versanode-os-kmods)    SUBPATH="versanode-os-kmods" ;;
+            Versa-Node/versanode-os-usermods) SUBPATH="versanode-os-usermods" ;;
+            *) echo "Unknown child $CHILD_REPO"; exit 1 ;;
+          esac
+
+          # Ensure submodule exists
+          git submodule update --init --recursive
+
+          # Move submodule to the latest commit of the child repo's default branch
+          git -C "$SUBPATH" remote set-url origin "https://github.com/${CHILD_REPO}.git"
+          git -C "$SUBPATH" fetch origin --tags
+          DEF_BRANCH="$(git -C "$SUBPATH" remote show origin | sed -n 's/.*HEAD branch: //p')"
+          git -C "$SUBPATH" checkout "origin/${DEF_BRANCH}"
+
+          NEW_SHA="$(git -C "$SUBPATH" rev-parse HEAD)"
+          git add "$SUBPATH"
+
+          if git diff --cached --quiet; then
+            echo "No submodule change."
+            exit 0
+          fi
+
+          git config user.name  "versanode-bot"
+          git config user.email "bot@versa-node.local"
+          git commit -m "chore(submodule): bump ${SUBPATH} to ${NEW_SHA}"
+          git push origin HEAD:main
