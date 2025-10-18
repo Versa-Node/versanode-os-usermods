@@ -1,6 +1,4 @@
 #!/bin/bash -e
-
-on_chroot <<'CHROOT'
 set -euxo pipefail
 
 # Ensure generator is executable
@@ -18,4 +16,3 @@ systemctl enable --now vncp-hostname.path || true
 # then nginx will be corrected on first boot by the timer/hostname.path
 /usr/local/sbin/vncp-nginx-generate || true
 nginx -t && systemctl reload nginx || true
-CHROOT

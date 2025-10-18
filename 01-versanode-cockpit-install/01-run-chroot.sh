@@ -1,6 +1,4 @@
 #!/bin/bash -e
-
-on_chroot <<'CHROOT'
 set -euxo pipefail
 
 . /etc/os-release
@@ -35,4 +33,3 @@ rm -rf "$PLUGIN_CLONE" || true
 
 # Enable cockpit (socket-activated)
 systemctl enable --now cockpit.socket || true
-CHROOT
