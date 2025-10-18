@@ -8,7 +8,6 @@ COCKPIT_PORT="9090"
 NETWORK="<any>"
 DRY_RUN=0
 DEBUG=0
-PRUNE_EMPTY=0
 RELOAD_CMD="systemctl reload nginx"
 
 log(){ echo "[vncp-nginx] $*"; }
@@ -49,6 +48,7 @@ $(printf "%s\n" "$body")
 EOF
 }
 
+# --- Discover labeled containers ---
 entries_json="[]"
 mapfile -t CIDS < <(docker ps -q --filter "label=${LABEL_KEY}")
 for cid in "${CIDS[@]}"; do
@@ -78,9 +78,11 @@ for cid in "${CIDS[@]}"; do
   with_cid="$(jq --arg cid "$cid" 'map(. + { __cid: $cid })' <<<"$normalized_array")"
   entries_json="$(jq -s 'add' <(printf '%s' "$entries_json") <(printf '%s' "$with_cid"))"
 done
-
 count="$(jq 'length' <<<"$entries_json")"
+
+# --- Generate full server block (always includes Cockpit) ---
 tmpfile="$(mktemp)"; trap 'rm -f "$tmpfile"' EXIT
+mkdir -p "$(dirname "$OUT")"
 
 {
   cat <<EOF
@@ -90,10 +92,13 @@ server {
     listen ${LISTEN_ADDR} default_server;
     server_name _;
 
+    # Health
     location = /healthz { return 200; }
+
+    # Root: 404
     location = / { return 404; }
 
-    # Cockpit only under /cockpit/
+    # Cockpit always available under /cockpit/
     location ^~ /cockpit/ {
         proxy_pass http://127.0.0.1:${COCKPIT_PORT}/cockpit/;
         proxy_http_version 1.1;
@@ -108,6 +113,7 @@ server {
     }
 
 EOF
+
   if [[ "$count" -gt 0 ]]; then
     for i in $(seq 0 $((count-1))); do
       item="$(jq -r ".[$i]" <<<"$entries_json")"
@@ -118,27 +124,37 @@ EOF
       cid="$(jq -r '.__cid' <<<"$item")"
       host="$(get_upstream_host "$cid" "$NETWORK" || true)"
       [[ -z "$host" ]] && continue
+
       block_src=""
       if [[ -n "$b64" ]]; then block_src="$(b64decode "$b64")"
       elif [[ -n "$ptxt" ]]; then block_src="$ptxt"
       else continue; fi
+
       path="/${slug}"
       block_final="$(subst_block "$block_src" "$slug" "$path" "$host" "$port")"
       block_final_indented="$(printf "%s" "$block_final" | sed 's/^/    /')"
       wrap_block_with_marker "$slug" "$cid" "$host" "$port" "$block_final_indented"
     done
   fi
+
   cat <<'EOF'
+    # Unknown paths -> 404
     location / { return 404; }
 }
 EOF
 } >"$tmpfile"
 
+# --- Write only if changed; reload only on change ---
 need_write=1
-if [[ -f "$OUT" ]] and cmp -s "$tmpfile" "$OUT"; then need_write=0; fi
+if [[ -f "$OUT" ]] && cmp -s "$tmpfile" "$OUT"; then
+  need_write=0
+fi
+
 if [[ "$need_write" -eq 1 ]]; then
   install -m 0644 -T "$tmpfile" "$OUT"
   if nginx -t >/dev/null 2>&1; then
     eval "${RELOAD_CMD}" || true
   fi
+else
+  log "No changes; not reloading nginx."
 fi
