@@ -1,0 +1,8 @@
+[Unit]
+Description=Generate nginx reverse-proxy config from VersaNode container labels
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vncp-nginx-generator.sh
