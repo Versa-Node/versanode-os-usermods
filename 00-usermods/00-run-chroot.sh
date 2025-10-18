@@ -17,6 +17,16 @@ chmod +x /usr/local/sbin/vncp-nginx-generator.sh
 # Enable services
 systemctl enable docker
 systemctl start docker
+
+# --- Allow default user to use Docker without sudo ---
+# Use the first non-root user in /home (e.g. versanode or pi)
+DEFAULT_USER="$(ls /home | head -n1 || true)"
+if [ -n "$DEFAULT_USER" ]; then
+  log "Adding $DEFAULT_USER to docker group"
+  groupadd -f docker
+  usermod -aG docker "$DEFAULT_USER"
+fi
+
 systemctl enable nginx || true
 systemctl enable cockpit.socket
 systemctl enable --now vncp-nginx-generator.timer
