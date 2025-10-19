@@ -17,16 +17,24 @@ LABEL_KEY="io.versanode.vncp.proxies"
 : "${NETWORK:=<any>}"
 : "${RELOAD_CMD:=systemctl reload nginx}"
 
+# TLS + mkcert
 : "${TLS_ENABLE:=1}"
 : "${TLS_DIR:=/etc/nginx/tls}"
 : "${CA_DIR:=${TLS_DIR}/ca}"
+: "${SRV_DIR:=${TLS_DIR}/server}"
+: "${COCKPIT_WS_DIR:=/etc/cockpit/ws-certs.d}"
+: "${LOCAL_HOSTNAME:=versanode.local}"           # primary local hostname for mkcert
+: "${EXTRA_SANS:=}"                               # comma-separated extra SANs, e.g. "DNS:foo.local,IP:10.0.0.5"
+
 CA_KEY="${CA_DIR}/ca.key"
 CA_CRT="${CA_DIR}/ca.crt"
-: "${SRV_DIR:=${TLS_DIR}/server}"
 SRV_KEY="${SRV_DIR}/server.key"
 SRV_CRT="${SRV_DIR}/server.crt"
 SRV_CSR="${SRV_DIR}/server.csr"
-: "${SRV_SANS:=}"
+
+COCKPIT_CERT="${COCKPIT_WS_DIR}/10-${LOCAL_HOSTNAME}.cert"
+COCKPIT_KEY="${COCKPIT_WS_DIR}/10-${LOCAL_HOSTNAME}.key"
+
 : "${TLS_CIPHERS:=HIGH:!aNULL:!MD5}"
 : "${TLS_PROTOCOLS:=TLSv1.2 TLSv1.3}"
 : "${SRV_DAYS:=825}"
@@ -39,7 +47,7 @@ log(){ echo "[vncp-nginx] $*"; }
 die(){ echo "[vncp-nginx][err] $*" >&2; exit 1; }
 b64decode(){ printf "%s" "$1" | tr -d "\n" | base64 -d 2>/dev/null || true; }
 
-write_if_changed(){ # src dst -> 0 if wrote/changed, 1 if identical
+write_if_changed(){ # src dst -> 0 wrote/changed, 1 identical
   local src="$1" dst="$2"
   if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then return 1; fi
   install -D -m 0644 -T "$src" "$dst"
@@ -75,12 +83,24 @@ subst_block(){
 }
 
 collect_sans(){
-  local host ip sans=()
-  host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)"
-  [[ -n "$host" ]] && sans+=("DNS:${host}")
-  local sh; sh="$(hostname -s 2>/dev/null || true)"; [[ -n "$sh" && "$sh" != "$host" ]] && sans+=("DNS:${sh}")
+  local sans=()
+  # primary .local name first
+  [[ -n "$LOCAL_HOSTNAME" ]] && sans+=("DNS:${LOCAL_HOSTNAME}")
+
+  # system hostnames
+  local fqdn sh
+  fqdn="$(hostname -f 2>/dev/null || true)"; sh="$(hostname -s 2>/dev/null || true)"
+  [[ -n "$fqdn" ]] && sans+=("DNS:${fqdn}")
+  [[ -n "$sh" && "$sh" != "$fqdn" ]] && sans+=("DNS:${sh}")
+
+  # IPs
   while read -r ip; do [[ -n "$ip" ]] && sans+=("IP:${ip}"); done < <(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1)
-  if [[ -n "$SRV_SANS" ]]; then IFS=, read -ra E <<<"$SRV_SANS"; for e in "${E[@]}"; do [[ -n "$e" ]] && sans+=("$e"); done; fi
+  while read -r ip6; do [[ -n "$ip6" ]] && sans+=("IP:${ip6}"); done < <(ip -o -6 addr show scope global | awk '{print $4}' | cut -d/ -f1)
+
+  # extra SANs (comma-separated: DNS:foo,IP:1.2.3.4)
+  if [[ -n "$EXTRA_SANS" ]]; then
+    IFS=, read -ra E <<<"$EXTRA_SANS"; for e in "${E[@]}"; do [[ -n "$e" ]] && sans+=("$e"); done
+  fi
   (IFS=,; printf "%s" "${sans[*]}")
 }
 
@@ -113,46 +133,73 @@ EOF
   rm -f "$tmp"; return 1
 }
 
-# ── TLS: local CA + server cert; fix key perms for nginx ────────────────────
+# ── TLS via mkcert first; fallback to OpenSSL local CA ──────────────────────
 ensure_tls(){
   [[ "$TLS_ENABLE" -eq 1 ]] || return 0
-  mkdir -p "$CA_DIR" "$SRV_DIR" "$STATE_DIR"
+  mkdir -p "$CA_DIR" "$SRV_DIR" "$STATE_DIR" "$COCKPIT_WS_DIR"
+
   local current_host; current_host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)"
   local last_host=""; [[ -s "$LAST_HOST_FILE" ]] && last_host="$(cat "$LAST_HOST_FILE" 2>/dev/null || true)" || true
 
   if [[ "$current_host" != "$last_host" ]]; then
     echo "$current_host" > "$LAST_HOST_FILE"
-    rm -f "$SRV_KEY" "$SRV_CRT" "$SRV_CSR"
-    log "Hostname changed (${last_host} -> ${current_host}); reissuing server cert."
+    rm -f "$SRV_KEY" "$SRV_CRT" "$SRV_CSR" || true
+    log "Hostname changed (${last_host} -> ${current_host}); certs will be (re)issued."
   fi
 
-  if [[ ! -s "$CA_KEY" || ! -s "$CA_CRT" ]]; then
-    log "Creating local CA (once) in $CA_DIR"
-    openssl genrsa -out "$CA_KEY" 4096 >/dev/null 2>&1
-    openssl req -x509 -new -nodes -key "$CA_KEY" -sha256 -days 3650 \
-      -subj "/CN=VersaNode Local CA" -out "$CA_CRT" >/dev/null 2>&1
+  local used_mkcert=0
+  if command -v mkcert >/dev/null 2>&1; then
+    used_mkcert=1
+    log "mkcert found — generating a locally-trusted certificate for ${LOCAL_HOSTNAME}"
+    # Build mkcert SAN args: mkcert takes bare names/IPs
+    # We pass: LOCAL_HOSTNAME, hostnames, and IPs
+    mapfile -t SAN_LIST < <(
+      {
+        [[ -n "$LOCAL_HOSTNAME" ]] && echo "$LOCAL_HOSTNAME"
+        hostname -f 2>/dev/null || true
+        hostname -s 2>/dev/null || true
+        ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1
+        ip -o -6 addr show scope global | awk '{print $4}' | cut -d/ -f1
+      } | awk 'NF' | sort -u
+    )
+    # mkcert writes both files directly; we set filenames to our target
+    mkcert -cert-file "$SRV_CRT" -key-file "$SRV_KEY" "${SAN_LIST[@]}" >/dev/null 2>&1 || {
+      log "mkcert failed; falling back to OpenSSL local CA."
+      used_mkcert=0
+      rm -f "$SRV_CRT" "$SRV_KEY" || true
+    }
   fi
 
-  if [[ -s "$SRV_CRT" ]]; then
-    local enddate expiry_ts now_ts days_left
-    enddate="$(openssl x509 -enddate -noout -in "$SRV_CRT" 2>/dev/null | cut -d= -f2 || true)"
-    if [[ -n "$enddate" ]]; then
-      expiry_ts="$(date -d "$enddate" +%s 2>/dev/null || true)"
-      now_ts="$(date +%s)"
-      if [[ -n "$expiry_ts" ]]; then
-        days_left="$(( (expiry_ts - now_ts) / 86400 ))"
-        if (( days_left < RENEW_DAYS )); then
-          log "Server cert expires in ${days_left} days (< ${RENEW_DAYS}); renewing."
-          rm -f "$SRV_KEY" "$SRV_CRT" "$SRV_CSR"
+  if [[ "$used_mkcert" -eq 0 ]]; then
+    # OpenSSL local CA fallback (clients must install $CA_CRT to trust)
+    [[ -s "$CA_KEY" && -s "$CA_CRT" ]] || {
+      log "Creating local OpenSSL CA (once) in $CA_DIR"
+      openssl genrsa -out "$CA_KEY" 4096 >/dev/null 2>&1
+      openssl req -x509 -new -nodes -key "$CA_KEY" -sha256 -days 3650 \
+        -subj "/CN=VersaNode Local CA" -out "$CA_CRT" >/dev/null 2>&1
+      log "Local CA created: ${CA_CRT}  (distribute to client trust stores)"
+    }
+
+    local recreate=0
+    if [[ -s "$SRV_CRT" ]]; then
+      local enddate expiry_ts now_ts days_left
+      enddate="$(openssl x509 -enddate -noout -in "$SRV_CRT" 2>/dev/null | cut -d= -f2 || true)"
+      if [[ -n "$enddate" ]]; then
+        expiry_ts="$(date -d "$enddate" +%s 2>/dev/null || true)"
+        now_ts="$(date +%s)"
+        if [[ -n "$expiry_ts" ]]; then
+          days_left="$(( (expiry_ts - now_ts) / 86400 ))"
+          (( days_left < RENEW_DAYS )) && recreate=1
         fi
       fi
+    else
+      recreate=1
     fi
-  fi
 
-  if [[ ! -s "$SRV_KEY" || ! -s "$SRV_CRT" ]]; then
-    local SANS; SANS="$(collect_sans)"
-    log "Issuing server certificate (SANs: $SANS, days: ${SRV_DAYS})"
-    cat >"$SRV_DIR/openssl.cnf" <<CFG
+    if (( recreate )); then
+      local SANS; SANS="$(collect_sans)"
+      log "Issuing server certificate via local CA (SANs: $SANS, days: ${SRV_DAYS})"
+      cat >"$SRV_DIR/openssl.cnf" <<CFG
 [req]
 distinguished_name=req
 req_extensions=req_ext
@@ -160,17 +207,29 @@ prompt=no
 [req_ext]
 subjectAltName=${SANS}
 CFG
-    openssl genrsa -out "$SRV_KEY" 2048 >/dev/null 2>&1
-    openssl req -new -key "$SRV_KEY" -subj "/CN=vncp-local" \
-      -out "$SRV_CSR" -config "$SRV_DIR/openssl.cnf" >/dev/null 2>&1
-    openssl x509 -req -in "$SRV_CSR" -CA "$CA_CRT" -CAkey "$CA_KEY" -CAcreateserial \
-      -out "$SRV_CRT" -days "$SRV_DAYS" -sha256 -extfile "$SRV_DIR/openssl.cnf" -extensions req_ext >/dev/null 2>&1
-
-    # nginx needs to read the key: owner root, readable by group (ssl-cert), 0640
-    chown root:root "$SRV_KEY" "$SRV_CRT" || true
-    chmod 0640 "$SRV_KEY" || true
-    chmod 0644 "$SRV_CRT" || true
+      openssl genrsa -out "$SRV_KEY" 2048 >/dev/null 2>&1
+      openssl req -new -key "$SRV_KEY" -subj "/CN=${LOCAL_HOSTNAME}" \
+        -out "$SRV_CSR" -config "$SRV_DIR/openssl.cnf" >/dev/null 2>&1
+      openssl x509 -req -in "$SRV_CSR" -CA "$CA_CRT" -CAkey "$CA_KEY" -CAcreateserial \
+        -out "$SRV_CRT" -days "$SRV_DAYS" -sha256 -extfile "$SRV_DIR/openssl.cnf" -extensions req_ext >/dev/null 2>&1
+      log "Server cert created: ${SRV_CRT} (trust CA on clients: ${CA_CRT})"
+    fi
+  else
+    # mkcert path: advise user about client-side CA install
+    log "mkcert certificate ready at ${SRV_CRT}. Ensure mkcert CA is installed on client machines."
   fi
+
+  # perms for Nginx & Cockpit
+  chown root:root "$SRV_KEY" "$SRV_CRT" || true
+  chmod 0640 "$SRV_KEY" || true
+  chmod 0644 "$SRV_CRT" || true
+
+  # Cockpit wants cert+key; support separate files as requested
+  # Copy/symlink to ws-certs.d so Cockpit picks it up
+  install -d -m 0755 "$COCKPIT_WS_DIR"
+  # Use copies to avoid surprises if TLS_DIR is on a different FS
+  install -m 0644 "$SRV_CRT" "$COCKPIT_CERT"
+  install -m 0640 "$SRV_KEY" "$COCKPIT_KEY"
 }
 
 # ── Optional: discover container proxies via labels ─────────────────────────
@@ -327,4 +386,5 @@ else
   log "No nginx changes; not reloading."
 fi
 
-log "Done. Try: https://$(hostname -f 2>/dev/null || hostname)/cockpit/"
+log "Done. Try: https://${LOCAL_HOSTNAME}/cockpit/  (or https://$(hostname -f 2>/dev/null || hostname)/cockpit/)"
+log "Note: For a green lock, client machines must trust the mkcert CA (mkcert -install on each client) or import ${CA_CRT} if OpenSSL fallback was used."
