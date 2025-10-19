@@ -2,21 +2,29 @@
 set -euxo pipefail
 
 # ---------------------------------------------------------------------------
-# 🧭 Diagnostics: environment overview
+# Resolve paths relative to this script (robust in CI)
 # ---------------------------------------------------------------------------
 : "${ROOTFS_DIR:?ROOTFS_DIR must be set}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FILES_DIR="${SCRIPT_DIR}/files"
 
 echo "──────────────────────────────────────────────"
 echo "🔧 Starting vncp-nginx installation stage"
-echo "📂 ROOTFS_DIR = ${ROOTFS_DIR}"
-echo "📂 Current working directory: $(pwd)"
-echo "📂 Files available under: $(ls -1 files || true)"
+echo "📂 ROOTFS_DIR      = ${ROOTFS_DIR}"
+echo "📂 SCRIPT_DIR      = ${SCRIPT_DIR}"
+echo "📂 FILES_DIR       = ${FILES_DIR}"
+echo "📂 pwd             = $(pwd)"
+echo "📂 files/ contents:"
+ls -la "${FILES_DIR}" || { echo "❌ files/ directory missing at ${FILES_DIR}"; exit 1; }
 echo "──────────────────────────────────────────────"
 
+# Sanity checks for required files
+[ -f "${FILES_DIR}/vncp-nginx-generate" ] || { echo "❌ Missing ${FILES_DIR}/vncp-nginx-generate"; exit 1; }
+# The unit files are optional; we check existence later
+
 # ---------------------------------------------------------------------------
-# 🧱 Ensure target directories exist
+# Ensure destination directories exist
 # ---------------------------------------------------------------------------
-echo "📁 Ensuring destination directories exist..."
 mkdir -pv \
   "${ROOTFS_DIR}/usr/local/sbin" \
   "${ROOTFS_DIR}/etc/systemd/system" \
@@ -24,93 +32,83 @@ mkdir -pv \
   "${ROOTFS_DIR}/etc/nginx/sites-enabled"
 
 # ---------------------------------------------------------------------------
-# 1️⃣ Install helper script
+# 1) Copy helper script
 # ---------------------------------------------------------------------------
 echo "⚙️ Installing vncp-nginx-generate helper..."
-install -v -D -m 0755 files/vncp-nginx-generate \
-  "${ROOTFS_DIR}/usr/local/sbin/vncp-nginx-generate"
+cp -v "${FILES_DIR}/vncp-nginx-generate" \
+      "${ROOTFS_DIR}/usr/local/sbin/vncp-nginx-generate"
+chmod 0755 "${ROOTFS_DIR}/usr/local/sbin/vncp-nginx-generate"
 
 # ---------------------------------------------------------------------------
-# 2️⃣ Install systemd units (timer + service)
+# 2) Copy systemd units (timer + service) if present
 # ---------------------------------------------------------------------------
-echo "⚙️ Installing systemd units..."
-install -v -D -m 0644 files/vncp-nginx-generate.timer \
-  "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.timer"
-install -v -D -m 0644 files/vncp-nginx-generate.service \
-  "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.service"
-
-# Optional hostname watcher units (only if shipped)
-if [ -f files/vncp-hostname.path ]; then
-  echo "⚙️ Installing vncp-hostname.path..."
-  install -v -D -m 0644 files/vncp-hostname.path \
-    "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.path"
+echo "⚙️ Installing systemd units (if provided)..."
+if [ -f "${FILES_DIR}/vncp-nginx-generate.timer" ]; then
+  cp -v "${FILES_DIR}/vncp-nginx-generate.timer" \
+        "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.timer"
+  chmod 0644 "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.timer"
 fi
 
-if [ -f files/vncp-hostname.service ]; then
-  echo "⚙️ Installing vncp-hostname.service..."
-  install -v -D -m 0644 files/vncp-hostname.service \
-    "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.service"
+if [ -f "${FILES_DIR}/vncp-nginx-generate.service" ]; then
+  cp -v "${FILES_DIR}/vncp-nginx-generate.service" \
+        "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.service"
+  chmod 0644 "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.service"
+fi
+
+# Optional hostname watcher units
+if [ -f "${FILES_DIR}/vncp-hostname.path" ]; then
+  cp -v "${FILES_DIR}/vncp-hostname.path" \
+        "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.path"
+  chmod 0644 "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.path"
+fi
+
+if [ -f "${FILES_DIR}/vncp-hostname.service" ]; then
+  cp -v "${FILES_DIR}/vncp-hostname.service" \
+        "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.service"
+  chmod 0644 "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.service"
 fi
 
 # ---------------------------------------------------------------------------
-# 3️⃣ (Optional) Ship nginx site and enable it
+# 3) (Optional) nginx site
 # ---------------------------------------------------------------------------
-if [ -f files/nginx/vncp.conf ]; then
+if [ -f "${FILES_DIR}/nginx/vncp.conf" ]; then
   echo "🌐 Installing nginx site vncp.conf..."
-  install -v -D -m 0644 files/nginx/vncp.conf \
-    "${ROOTFS_DIR}/etc/nginx/sites-available/vncp.conf"
+  cp -v "${FILES_DIR}/nginx/vncp.conf" \
+        "${ROOTFS_DIR}/etc/nginx/sites-available/vncp.conf"
+  chmod 0644 "${ROOTFS_DIR}/etc/nginx/sites-available/vncp.conf"
   ln -svf ../sites-available/vncp.conf \
-    "${ROOTFS_DIR}/etc/nginx/sites-enabled/vncp.conf"
+        "${ROOTFS_DIR}/etc/nginx/sites-enabled/vncp.conf"
 else
-  echo "ℹ️ No custom nginx site (files/nginx/vncp.conf) provided."
+  echo "ℹ️ No custom nginx site at ${FILES_DIR}/nginx/vncp.conf (skipping)"
 fi
 
 # ---------------------------------------------------------------------------
-# 4️⃣ Remove default nginx site (if present)
+# 4) Remove default nginx site (if present)
 # ---------------------------------------------------------------------------
-if [ -e "${ROOTFS_DIR}/etc/nginx/sites-enabled/default" ]; then
-  echo "🧹 Removing default nginx site..."
-  rm -vf "${ROOTFS_DIR}/etc/nginx/sites-enabled/default"
-else
-  echo "ℹ️ Default nginx site not present — skipping removal."
-fi
+rm -vf "${ROOTFS_DIR}/etc/nginx/sites-enabled/default" || true
 
 # ---------------------------------------------------------------------------
-# 5️⃣ In-chroot actions
+# 5) In-chroot actions
 # ---------------------------------------------------------------------------
-echo "🚀 Entering chroot to finalize setup..."
 on_chroot <<'EOF'
 set -eux
 
-echo "🔍 Inside chroot environment"
-echo "📍 Current hostname: $(hostname)"
-echo "📦 Checking nginx installation..."
+export DEBIAN_FRONTEND=noninteractive
 
+# Install nginx if missing
 if ! dpkg -s nginx >/dev/null 2>&1; then
-  echo "📦 Installing nginx..."
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
-else
-  echo "✅ nginx already installed."
+  apt-get install -y --no-install-recommends nginx
 fi
 
-echo "🔁 Reloading systemd daemon..."
+# Make systemd aware of the new units and enable them if present
 systemctl daemon-reload || true
-
-echo "🧩 Enabling units if present..."
 [ -f /etc/systemd/system/vncp-nginx-generate.timer ] && systemctl enable vncp-nginx-generate.timer || true
 [ -f /etc/systemd/system/vncp-nginx-generate.service ] && systemctl enable vncp-nginx-generate.service || true
 [ -f /etc/systemd/system/vncp-hostname.path ] && systemctl enable vncp-hostname.path || true
 [ -f /etc/systemd/system/vncp-hostname.service ] && systemctl enable vncp-hostname.service || true
 
-echo "🌐 Enabling nginx service..."
 systemctl enable nginx || true
-
-echo "✅ vncp-nginx setup inside chroot completed."
 EOF
 
-echo "✅ Completed vncp-nginx installation and diagnostics summary:"
-echo "   - Helper script installed in /usr/local/sbin"
-echo "   - Systemd units installed in /etc/systemd/system"
-echo "   - nginx site installed (if provided)"
-echo "──────────────────────────────────────────────"
+echo "✅ Completed vncp-nginx installation."

@@ -3,31 +3,33 @@ set -euxo pipefail
 
 . /etc/os-release
 
-# Backports (for newer cockpit on Bookworm/Trixie)
+# Backports: newer cockpit on Bookworm/Trixie
 echo "deb http://deb.debian.org/debian ${VERSION_CODENAME}-backports main" \
   > /etc/apt/sources.list.d/backports.list
 apt-get update
 
-# 1) Cockpit from backports (no podman/machines)
+# Core cockpit
 apt-get install -y -t "${VERSION_CODENAME}-backports" cockpit
 
-# 2) Build deps for the plugin
-#    - nodejs, npm: for build.js + node-modules-fix.sh
-#    - make, git: build tooling
-#    - gettext: msgfmt/xgettext used in i18n targets
-#    - appstream (optional): provides appstream-util; Makefile handles "if present"
+# Build deps
 apt-get install -y --no-install-recommends \
-  nodejs npm make git gettext appstream
+  nodejs npm make git gettext appstream ca-certificates
 
-# Optional: trim podman/VM stacks
-apt-get -y purge \
-  podman cockpit-podman cockpit-machines \
+# Optional: keep stack lean (remove if you actually want these)
+apt-get -y purge podman cockpit-podman cockpit-machines \
   libvirt-daemon-system libvirt-daemon libvirt-clients \
   qemu-system qemu-utils virt-manager virtinst || true
 apt-get -y autoremove --purge || true
 apt-get -y clean || true
 
-# 3) Clone plugin (recursive for submodules)
+# Prevent service starts in chroot (quietens avahi/dbus noise)
+cat >/usr/sbin/policy-rc.d <<'POLICY'
+#!/bin/sh
+exit 101
+POLICY
+chmod +x /usr/sbin/policy-rc.d
+
+# Clone plugin
 PLUGIN_CLONE="/root/cockpit-vncp-manager"
 rm -rf "$PLUGIN_CLONE" || true
 git clone --recursive https://github.com/Versa-Node/versanode-cockpit-vncp-manager "$PLUGIN_CLONE"
@@ -35,26 +37,22 @@ cd "$PLUGIN_CLONE"
 git submodule sync --recursive
 git submodule update --init --recursive
 
-# 4) Make sure helper scripts are executable (just in case)
-chmod +x node-modules-fix.sh || true
-chmod +x build.js || true
-chmod +x tools/node-modules || true
-
-# Diagnostics
-node -v
-npm -v
-command -v msgfmt
-command -v xgettext
-command -v appstream-util || echo "appstream-util not installed (ok)"
-ls -l node-modules-fix.sh build.js tools/node-modules
+# Ensure executables needed by Makefile are executable
+chmod +x build.js node-modules-fix.sh || true
+[ -f tools/node-modules ] && chmod +x tools/node-modules || true
 
 
-# 5) Build & install (we are root in chroot; no sudo needed)
-make install
+# Optional: ensure po dir exists (won’t hurt if empty)
+mkdir -p po
+: > po/LINGUAS
 
-# 6) Clean up
+# Build & install (PREFIX=/usr so cockpit sees it under /usr/share/cockpit)
+make PREFIX=/usr install
+
+# Cleanup
 cd /
+rm -f /usr/sbin/policy-rc.d    # restore normal service start on first boot
 rm -rf "$PLUGIN_CLONE" || true
 
-# 7) Enable cockpit (socket-activated)
-systemctl enable --now cockpit.socket || true
+# Enable cockpit (don’t --now in chroot)
+systemctl enable cockpit.socket || true
