@@ -26,7 +26,7 @@ PLUGIN_CLONE="/root/cockpit-vncp-manager"
 rm -rf "$PLUGIN_CLONE" || true
 git clone https://github.com/Versa-Node/cockpit-vncp-manager "$PLUGIN_CLONE"
 cd "$PLUGIN_CLONE"
-make install
+sudo -n make install
 cd /root
 rm -rf "$PLUGIN_CLONE" || true
 
