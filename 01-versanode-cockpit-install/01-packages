@@ -1,6 +1,9 @@
-nodejs
 cockpit
 git
 gettext
 make
 jq
+curl
+ca-certificates
+appstream
+gnupg

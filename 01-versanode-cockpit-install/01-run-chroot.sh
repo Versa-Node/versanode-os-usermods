@@ -1,67 +1,88 @@
-#!/bin/bash -e
+#!/usr/bin/env bash
 set -euxo pipefail
 
-. /etc/os-release
+: "${ROOTFS_DIR:?ROOTFS_DIR must be set}"
 
-# ---------------------------------------------------------------------------
-# 🧩 Add backports (for newer cockpit on Bookworm/Trixie)
-# ---------------------------------------------------------------------------
-echo "deb http://deb.debian.org/debian ${VERSION_CODENAME}-backports main" \
-  > /etc/apt/sources.list.d/backports.list
-apt-get update
+# Everything below runs inside the target rootfs via pi-gen's on_chroot
+on_chroot <<'EOF'
+set -euxo pipefail
 
-# ---------------------------------------------------------------------------
-# 🧱 Install dependencies for Cockpit and Node build
-# ---------------------------------------------------------------------------
-apt-get install -y -t "${VERSION_CODENAME}-backports" cockpit
-apt-get install -y --no-install-recommends \
-  curl ca-certificates make git gettext appstream gnupg
+# --- 0) Prevent service start inside chroot (dbus/avahi noise) ---
+cat >/usr/sbin/policy-rc.d <<'P'
+#!/bin/sh
+exit 101
+P
+chmod +x /usr/sbin/policy-rc.d
 
-# ---------------------------------------------------------------------------
-# 📦 Install Node.js v22.20.0 and npm v10.9.3 from NodeSource
-# ---------------------------------------------------------------------------
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-apt-get install -y nodejs
+# --- 1) Cockpit from backports if not already present (you already installed base pkgs in packages) ---
+. /etc/os-release || true
+CODENAME="${VERSION_CODENAME:-bookworm}"
 
-# Force npm upgrade to v10.9.3 (Node 22 ships ~10.x but ensure pinned)
-npm install -g npm@10.9.3
+if ! dpkg -s cockpit >/dev/null 2>&1; then
+  echo "deb http://deb.debian.org/debian ${CODENAME}-backports main" \
+    > /etc/apt/sources.list.d/backports.list
+  apt-get update
+  apt-get install -y -t "${CODENAME}-backports" cockpit || apt-get install -y cockpit
+fi
 
-echo "✅ Node.js version: $(node -v)"
-echo "✅ npm version: $(npm -v)"
+# --- 2) Node.js 22 + npm 10 inside the chroot (for build only) ---
+if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/^v//;s/\..*//')" -lt 22 ]; then
+  # curl, ca-certificates, gnupg already provided by your packages file
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  apt-get install -y nodejs
+  npm install -g npm@10.9.3
+fi
+node -v
+npm -v
 
-# ---------------------------------------------------------------------------
-# 🧹 Optional: trim podman/VM stack (keep chroot clean)
-# ---------------------------------------------------------------------------
+# --- 3) Fetch & build the plugin inside the chroot ---
+PLUGIN_DIR="/root/cockpit-vncp-manager"
+rm -rf "${PLUGIN_DIR}" || true
+git clone --recursive https://github.com/Versa-Node/versanode-cockpit-vncp-manager "${PLUGIN_DIR}"
+cd "${PLUGIN_DIR}"
+git submodule sync --recursive
+git submodule update --init --recursive
+
+# Normalize line endings and ensure executables (harmless if already fine)
+for f in build.js node-modules-fix.sh tools/node-modules; do
+  [ -f "$f" ] || continue
+  sed -i 's/\r$//' "$f" || true
+  chmod +x "$f" || true
+done
+
+# Ensure cockpit helper pulled by Makefile exists
+make pkg/lib/cockpit-po-plugin.js
+
+# Lockfile + deterministic install
+[ -f package-lock.json ] || npm install --package-lock-only --ignore-scripts
+npm ci --ignore-scripts
+
+# Run fixer explicitly via bash (avoids shebang/exec-bit issues)
+bash ./node-modules-fix.sh
+
+# Build dist expected by Makefile (dist/manifest.json)
+NODE_ENV=production node ./build.js
+test -f dist/manifest.json
+
+# i18n dir for msgfmt (Makefile uses it)
+mkdir -p po
+: > po/LINGUAS
+
+# Install under /usr so cockpit finds /usr/share/cockpit/<name>
+make PREFIX=/usr install
+
+# --- 4) Trim optional heavy stacks from the image ---
 apt-get -y purge podman cockpit-podman cockpit-machines \
   libvirt-daemon-system libvirt-daemon libvirt-clients \
   qemu-system qemu-utils virt-manager virtinst || true
 apt-get -y autoremove --purge || true
-apt-get -y clean || true
 
-# ---------------------------------------------------------------------------
-# 🧩 Clone plugin
-# ---------------------------------------------------------------------------
-PLUGIN_CLONE="/root/cockpit-vncp-manager"
-rm -rf "$PLUGIN_CLONE" || true
-git clone --recursive https://github.com/Versa-Node/versanode-cockpit-vncp-manager "$PLUGIN_CLONE"
-cd "$PLUGIN_CLONE"
-
-# ---------------------------------------------------------------------------
-# 🧰 Ensure executables and directories exist
-# ---------------------------------------------------------------------------
-chmod +x build.js node-modules-fix.sh || true
-[ -f tools/node-modules ] && chmod +x tools/node-modules || true
-mkdir -p po
-: > po/LINGUAS
-
-# ---------------------------------------------------------------------------
-# 🏗️ Build and install plugin (under /usr/share/cockpit)
-# ---------------------------------------------------------------------------
-make PREFIX=/usr install
-
-# ---------------------------------------------------------------------------
-# ⚙️ Enable cockpit (socket-activated)
-# ---------------------------------------------------------------------------
+# --- 5) Enable cockpit (socket-activated) ---
 systemctl enable cockpit.socket || true
 
-echo "✅ Cockpit + VNCP Manager build complete with Node $(node -v) / npm $(npm -v)"
+# --- 6) Cleanup: remove source tree, restore service starts, apt clean ---
+rm -rf "${PLUGIN_DIR}" || true
+rm -f /usr/sbin/policy-rc.d || true
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+EOF
