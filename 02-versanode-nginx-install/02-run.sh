@@ -1,9 +1,13 @@
-#!/bin/bash -e
-set -euxo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# ---------------------------------------------------------------------------
-# Resolve paths relative to this script (robust in CI)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# VersaNode OS — vncp-nginx installation (mkcert-enabled)
+# This stage copies the generator, units, optional nginx site,
+# prepares TLS directories, mirrors mkcert CA to a stable path,
+# writes default env vars, and primes an initial run inside chroot.
+# -----------------------------------------------------------------------------
+
 : "${ROOTFS_DIR:?ROOTFS_DIR must be set}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FILES_DIR="${SCRIPT_DIR}/files"
@@ -18,97 +22,119 @@ echo "📂 files/ contents:"
 ls -la "${FILES_DIR}" || { echo "❌ files/ directory missing at ${FILES_DIR}"; exit 1; }
 echo "──────────────────────────────────────────────"
 
-# Sanity checks for required files
+# Sanity checks
 [ -f "${FILES_DIR}/vncp-nginx-generate" ] || { echo "❌ Missing ${FILES_DIR}/vncp-nginx-generate"; exit 1; }
-# The unit files are optional; we check existence later
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Ensure destination directories exist
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 mkdir -pv \
   "${ROOTFS_DIR}/usr/local/sbin" \
   "${ROOTFS_DIR}/etc/systemd/system" \
   "${ROOTFS_DIR}/etc/nginx/sites-available" \
-  "${ROOTFS_DIR}/etc/nginx/sites-enabled"
+  "${ROOTFS_DIR}/etc/nginx/sites-enabled" \
+  "${ROOTFS_DIR}/etc/nginx/tls/ca" \
+  "${ROOTFS_DIR}/etc/nginx/tls/server" \
+  "${ROOTFS_DIR}/etc/cockpit/ws-certs.d" \
+  "${ROOTFS_DIR}/etc/default"
 
-# ---------------------------------------------------------------------------
-# 1) Copy helper script
-# ---------------------------------------------------------------------------
-echo "⚙️ Installing vncp-nginx-generate helper..."
-cp -v "${FILES_DIR}/vncp-nginx-generate" \
-      "${ROOTFS_DIR}/usr/local/sbin/vncp-nginx-generate"
-chmod 0755 "${ROOTFS_DIR}/usr/local/sbin/vncp-nginx-generate"
+# -----------------------------------------------------------------------------
+# 1) Copy generator helper
+# -----------------------------------------------------------------------------
+echo "⚙️ Installing vncp-nginx-generate helper…"
+install -m 0755 "${FILES_DIR}/vncp-nginx-generate" \
+                 "${ROOTFS_DIR}/usr/local/sbin/vncp-nginx-generate"
 
-# ---------------------------------------------------------------------------
-# 2) Copy systemd units (timer + service) if present
-# ---------------------------------------------------------------------------
-echo "⚙️ Installing systemd units (if provided)..."
-if [ -f "${FILES_DIR}/vncp-nginx-generate.timer" ]; then
-  cp -v "${FILES_DIR}/vncp-nginx-generate.timer" \
-        "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.timer"
-  chmod 0644 "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.timer"
-fi
+# -----------------------------------------------------------------------------
+# 2) Copy systemd units (timer/service/hostname watcher) if present
+# -----------------------------------------------------------------------------
+echo "⚙️ Installing systemd units (if provided)…"
+for f in vncp-nginx-generate.timer vncp-nginx-generate.service vncp-hostname.path vncp-hostname.service; do
+  if [ -f "${FILES_DIR}/${f}" ]; then
+    install -m 0644 "${FILES_DIR}/${f}" "${ROOTFS_DIR}/etc/systemd/system/${f}"
+  fi
+done
 
-if [ -f "${FILES_DIR}/vncp-nginx-generate.service" ]; then
-  cp -v "${FILES_DIR}/vncp-nginx-generate.service" \
-        "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.service"
-  chmod 0644 "${ROOTFS_DIR}/etc/systemd/system/vncp-nginx-generate.service"
-fi
-
-# Optional hostname watcher units
-if [ -f "${FILES_DIR}/vncp-hostname.path" ]; then
-  cp -v "${FILES_DIR}/vncp-hostname.path" \
-        "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.path"
-  chmod 0644 "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.path"
-fi
-
-if [ -f "${FILES_DIR}/vncp-hostname.service" ]; then
-  cp -v "${FILES_DIR}/vncp-hostname.service" \
-        "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.service"
-  chmod 0644 "${ROOTFS_DIR}/etc/systemd/system/vncp-hostname.service"
-fi
-
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 3) (Optional) nginx site
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 if [ -f "${FILES_DIR}/nginx/vncp.conf" ]; then
-  echo "🌐 Installing nginx site vncp.conf..."
-  cp -v "${FILES_DIR}/nginx/vncp.conf" \
-        "${ROOTFS_DIR}/etc/nginx/sites-available/vncp.conf"
-  chmod 0644 "${ROOTFS_DIR}/etc/nginx/sites-available/vncp.conf"
+  echo "🌐 Installing nginx site vncp.conf…"
+  install -m 0644 "${FILES_DIR}/nginx/vncp.conf" \
+                   "${ROOTFS_DIR}/etc/nginx/sites-available/vncp.conf"
   ln -svf ../sites-available/vncp.conf \
-        "${ROOTFS_DIR}/etc/nginx/sites-enabled/vncp.conf"
+          "${ROOTFS_DIR}/etc/nginx/sites-enabled/vncp.conf"
 else
   echo "ℹ️ No custom nginx site at ${FILES_DIR}/nginx/vncp.conf (skipping)"
 fi
 
-# ---------------------------------------------------------------------------
-# 4) Remove default nginx site (if present)
-# ---------------------------------------------------------------------------
+# Remove default site to avoid conflicts
 rm -vf "${ROOTFS_DIR}/etc/nginx/sites-enabled/default" || true
 
-# ---------------------------------------------------------------------------
-# 5) In-chroot actions
-# ---------------------------------------------------------------------------
-on_chroot <<'EOF'
-set -eux
-
-export DEBIAN_FRONTEND=noninteractive
-
-# Install nginx if missing
-if ! dpkg -s nginx >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y --no-install-recommends nginx
+# -----------------------------------------------------------------------------
+# 4) Provide default environment for the generator (if not supplied)
+#     This lets you tweak cert SANs/hostname without editing the script.
+# -----------------------------------------------------------------------------
+DEFAULT_ENV_PATH="${ROOTFS_DIR}/etc/default/vncp-nginx"
+if [ ! -f "${DEFAULT_ENV_PATH}" ]; then
+  cat > "${DEFAULT_ENV_PATH}" <<'CONF'
+# VersaNode Nginx/Cockpit TLS settings (mkcert)
+# Adjust these as needed; service loads them on start.
+LOCAL_HOSTNAME="versanode.local"
+# Comma-separated SANs e.g. DNS:versanode,IP:127.0.0.1,IP:10.0.0.5
+EXTRA_SANS="DNS:versanode,IP:127.0.0.1"
+RENEW_DAYS="10"
+CONF
+  chmod 0644 "${DEFAULT_ENV_PATH}"
 fi
 
-# Make systemd aware of the new units and enable them if present
-systemctl daemon-reload || true
-[ -f /etc/systemd/system/vncp-nginx-generate.timer ] && systemctl enable vncp-nginx-generate.timer || true
-[ -f /etc/systemd/system/vncp-nginx-generate.service ] && systemctl enable vncp-nginx-generate.service || true
-[ -f /etc/systemd/system/vncp-hostname.path ] && systemctl enable vncp-hostname.path || true
-[ -f /etc/systemd/system/vncp-hostname.service ] && systemctl enable vncp-hostname.service || true
+# -----------------------------------------------------------------------------
+# 5) In-chroot actions: ensure packages, mirror mkcert CA, enable units, prime run
+# -----------------------------------------------------------------------------
+on_chroot <<'EOF'
+set -eux
+export DEBIAN_FRONTEND=noninteractive
 
+# ── Ensure required packages (idempotent) ────────────────────────────────────
+# Usually installed by 00-packages, but keep this as a safety net for CI
+need_pkgs=""
+for p in nginx mkcert libnss3-tools openssl jq ca-certificates; do
+  if ! dpkg -s "$p" >/dev/null 2>&1; then
+    need_pkgs="$need_pkgs $p"
+  fi
+done
+if [ -n "$need_pkgs" ]; then
+  apt-get update
+  apt-get install -y --no-install-recommends $need_pkgs
+fi
+
+# ── Ensure TLS dirs exist ────────────────────────────────────────────────────
+install -d -m 0755 /etc/nginx/tls/ca /etc/nginx/tls/server /etc/cockpit/ws-certs.d
+
+# ── Mirror mkcert CA to a stable path for field docs (optional) ─────────────
+if command -v mkcert >/dev/null 2>&1; then
+  CA_ROOT="$(mkcert -CAROOT || true)"
+  if [ -n "$CA_ROOT" ] && [ -f "${CA_ROOT}/rootCA.pem" ]; then
+    install -m 0644 "${CA_ROOT}/rootCA.pem" /etc/nginx/tls/ca/ca.crt
+  fi
+fi
+
+# ── Make systemd aware & enable units ────────────────────────────────────────
+systemctl daemon-reload || true
+[ -f /etc/systemd/system/vncp-nginx-generate.timer ]   && systemctl enable vncp-nginx-generate.timer   || true
+[ -f /etc/systemd/system/vncp-nginx-generate.service ] && systemctl enable vncp-nginx-generate.service || true
+[ -f /etc/systemd/system/vncp-hostname.path ]          && systemctl enable vncp-hostname.path          || true
+[ -f /etc/systemd/system/vncp-hostname.service ]       && systemctl enable vncp-hostname.service       || true
 systemctl enable nginx || true
+
+# ── Prime once so image ships with certs/config present (no-op if missing) ──
+# This will:
+#  - generate mkcert server cert with SANs (hostname + IPs + EXTRA_SANS)
+#  - copy cert/key into /etc/cockpit/ws-certs.d/10-<hostname>.*
+#  - write nginx confs and reload nginx if valid
+if [ -x /usr/local/sbin/vncp-nginx-generate ]; then
+  /usr/local/sbin/vncp-nginx-generate || true
+fi
 EOF
 
-echo "✅ Completed vncp-nginx installation."
+echo "✅ Completed vncp-nginx installation (mkcert-enabled)."

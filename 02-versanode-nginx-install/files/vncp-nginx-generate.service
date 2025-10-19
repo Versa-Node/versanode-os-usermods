@@ -5,4 +5,5 @@ Requires=docker.service
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/default/vncp-nginx
 ExecStart=/usr/local/sbin/vncp-nginx-generate

@@ -1,5 +1,7 @@
 nginx-light
 docker.io
 jq
+mkcert
+libnss3-tools
 openssl
 ca-certificates
