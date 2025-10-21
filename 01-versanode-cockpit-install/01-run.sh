@@ -2,6 +2,12 @@
 set -euxo pipefail
 : "${ROOTFS_DIR:?ROOTFS_DIR must be set}"
 
+# Write the public GHCR token into the target rootfs
+install -d -m 0755 "${ROOTFS_DIR}/etc/versanode"
+printf '%s' "${GHCR_READ_PACKAGES_PUBLIC:-}" > "${ROOTFS_DIR}/etc/versanode/github.token"
+# World-readable is fine if you truly don't care about leakage; otherwise use 0600
+chmod 0644 "${ROOTFS_DIR}/etc/versanode/github.token"
+
 on_chroot <<'EOF'
 set -euxo pipefail
 
