@@ -2,10 +2,9 @@
 set -Eeuo pipefail
 
 # -----------------------------------------------------------------------------
-# VersaNode OS — vncp-nginx installation (mkcert-enabled)
-# This stage copies the generator, units, optional nginx site,
-# prepares TLS directories, mirrors mkcert CA to a stable path,
-# writes default env vars, and primes an initial run inside chroot.
+# VersaNode OS — vncp-nginx installation (mkcert-enabled, NO DOCKER HERE)
+# Copies helpers/units/site, installs nginx(+deps) and mkcert inside chroot,
+# prepares TLS dirs, mirrors mkcert CA, enables services, and primes config.
 # -----------------------------------------------------------------------------
 
 : "${ROOTFS_DIR:?ROOTFS_DIR must be set}"
@@ -13,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FILES_DIR="${SCRIPT_DIR}/files"
 
 echo "──────────────────────────────────────────────"
-echo "🔧 Starting vncp-nginx installation stage"
+echo "🔧 Starting vncp-nginx installation stage (no Docker)"
 echo "📂 ROOTFS_DIR      = ${ROOTFS_DIR}"
 echo "📂 SCRIPT_DIR      = ${SCRIPT_DIR}"
 echo "📂 FILES_DIR       = ${FILES_DIR}"
@@ -22,7 +21,7 @@ echo "📂 files/ contents:"
 ls -la "${FILES_DIR}" || { echo "❌ files/ directory missing at ${FILES_DIR}"; exit 1; }
 echo "──────────────────────────────────────────────"
 
-# Sanity checks
+# Sanity check
 [ -f "${FILES_DIR}/vncp-nginx-generate" ] || { echo "❌ Missing ${FILES_DIR}/vncp-nginx-generate"; exit 1; }
 
 # -----------------------------------------------------------------------------
@@ -73,7 +72,6 @@ rm -vf "${ROOTFS_DIR}/etc/nginx/sites-enabled/default" || true
 
 # -----------------------------------------------------------------------------
 # 4) Provide default environment for the generator (if not supplied)
-#     This lets you tweak cert SANs/hostname without editing the script.
 # -----------------------------------------------------------------------------
 DEFAULT_ENV_PATH="${ROOTFS_DIR}/etc/default/vncp-nginx"
 if [ ! -f "${DEFAULT_ENV_PATH}" ]; then
@@ -89,29 +87,29 @@ CONF
 fi
 
 # -----------------------------------------------------------------------------
-# 5) In-chroot actions: ensure packages, mirror mkcert CA, enable units, prime run
+# 5) In-chroot actions: install pkgs, TLS prep, enable units, prime once
 # -----------------------------------------------------------------------------
 on_chroot <<'EOF'
 set -eux
 export DEBIAN_FRONTEND=noninteractive
 
-# ── Ensure required packages (idempotent) ────────────────────────────────────
-# Usually installed by 00-packages, but keep this as a safety net for CI
-need_pkgs=""
-for p in nginx mkcert libnss3-tools openssl jq ca-certificates; do
-  if ! dpkg -s "$p" >/dev/null 2>&1; then
-    need_pkgs="$need_pkgs $p"
-  fi
-done
-if [ -n "$need_pkgs" ]; then
-  apt-get update
-  apt-get install -y --no-install-recommends $need_pkgs
+# Basic apt hygiene
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl gnupg jq openssl
+
+# ── NGINX: prefer nginx-light; fall back to nginx if not available ───────────
+if ! apt-get install -y --no-install-recommends nginx-light; then
+  echo "⚠️ nginx-light unavailable, falling back to 'nginx'"
+  apt-get install -y --no-install-recommends nginx
 fi
+
+# ── mkcert (and NSS tools for cert store integration) ────────────────────────
+apt-get install -y --no-install-recommends mkcert libnss3-tools
 
 # ── Ensure TLS dirs exist ────────────────────────────────────────────────────
 install -d -m 0755 /etc/nginx/tls/ca /etc/nginx/tls/server /etc/cockpit/ws-certs.d
 
-# ── Mirror mkcert CA to a stable path for field docs (optional) ─────────────
+# ── Mirror mkcert CA to a stable path (handy for field docs) ────────────────
 if command -v mkcert >/dev/null 2>&1; then
   CA_ROOT="$(mkcert -CAROOT || true)"
   if [ -n "$CA_ROOT" ] && [ -f "${CA_ROOT}/rootCA.pem" ]; then
@@ -128,13 +126,9 @@ systemctl daemon-reload || true
 systemctl enable nginx || true
 
 # ── Prime once so image ships with certs/config present (no-op if missing) ──
-# This will:
-#  - generate mkcert server cert with SANs (hostname + IPs + EXTRA_SANS)
-#  - copy cert/key into /etc/cockpit/ws-certs.d/10-<hostname>.*
-#  - write nginx confs and reload nginx if valid
 if [ -x /usr/local/sbin/vncp-nginx-generate ]; then
   /usr/local/sbin/vncp-nginx-generate || true
 fi
 EOF
 
-echo "✅ Completed vncp-nginx installation (mkcert-enabled)."
+echo "✅ Completed vncp-nginx installation."
